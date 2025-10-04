@@ -62,14 +62,39 @@
 
 
 /* Chat area header */
-.ai-chat-title{
+.ai-title-container {
+	display: flex;
+	align-items: center;
+	gap: 8px;
 	margin-right: auto;
+}
+
+.ai-chat-title{
     font-size: var(--font-smallest);
 	color: var(--text-muted);
 	opacity: 0.8;
     font-weight: 500;
     letter-spacing: 0.5px;
     text-transform: uppercase;
+}
+
+.ai-mcp-badge {
+	font-size: var(--font-smallest);
+	padding: 2px 6px;
+	border-radius: var(--radius-s);
+	font-weight: 500;
+	cursor: help;
+}
+
+.ai-mcp-badge.mcp-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.ai-mcp-badge.mcp-inactive {
+	background: var(--background-modifier-border);
+	color: var(--text-muted);
+	opacity: 0.6;
 }
 
 .ai-header-buttons{
@@ -427,4 +452,84 @@
 .ai-chat-message-final-response {
 	align-self: flex-start;
 	width: 100%;
+}
+
+/* Error message styles */
+.ai-error-message-container {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	padding: 8px;
+	background: var(--background-primary);
+	border: 1px solid var(--color-red);
+	border-radius: var(--radius);
+	margin: 4px 0;
+}
+
+.ai-error-icon {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 20px;
+	min-height: 20px;
+	cursor: pointer;
+	transition: transform 0.2s ease;
+}
+
+.ai-error-icon svg {
+	width: 18px;
+	height: 18px;
+	color: var(--color-red);
+}
+
+.ai-error-icon:hover {
+	transform: scale(1.1);
+}
+
+.ai-error-content {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.ai-error-title {
+	font-weight: 500;
+	color: var(--color-red);
+	font-size: var(--font-small);
+}
+
+.ai-error-message {
+	color: var(--text-muted);
+	font-size: var(--font-smaller);
+}
+
+.ai-error-details {
+	margin-top: 8px;
+	padding: 8px;
+	background: var(--background-secondary);
+	border-radius: var(--radius-s);
+	font-family: var(--font-monospace);
+	font-size: var(--font-smaller);
+	color: var(--text-muted);
+	max-height: 200px;
+	overflow-y: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.ai-error-details.collapsed {
+	display: none !important;
+}
+
+.ai-error-toggle {
+	font-size: var(--font-smallest);
+	color: var(--interactive-accent);
+	cursor: pointer;
+	text-decoration: underline;
+	margin-top: 4px;
+}
+
+.ai-error-toggle:hover {
+	opacity: 0.8;
 }

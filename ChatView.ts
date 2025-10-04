@@ -2,6 +2,8 @@ import { ItemView, WorkspaceLeaf, setIcon } from 'obsidian';
 import type { AIChatSettings } from './types';
 import { spawn, ChildProcess } from 'child_process';
 import { CommandDetector } from './commandDetector';
+import type { AIService } from './services/ai/AIService';
+import { MCPManager } from './services/mcp/MCPManager';
 
 export const VIEW_TYPE_AI_CHAT = 'ai-chat-view';
 
@@ -39,7 +41,7 @@ interface Message {
 }
 
 interface ChatMessage {
-	type: "assistant" | "user" | "result" | "system";
+	type: "assistant" | "user" | "result" | "system" | "error";
 	message?: Message;
 	subtype?: "success" | "error" | "init";
 	duration_ms?: number;
@@ -52,10 +54,18 @@ interface ChatMessage {
 	uuid: string;
 	timestamp?: Date;
 	isUserInput?: boolean;
+	errorDetails?: {
+		title: string;
+		message: string;
+		stack?: string;
+		fullError?: any;
+	};
 }
 
 export class AIChatView extends ItemView {
 	settings: AIChatSettings;
+	aiService: AIService;
+	mcpManager: MCPManager;
 	messages: ChatMessage[] = [];
 	chatContainer: HTMLElement;
 	messagesContainer: HTMLElement;
@@ -64,14 +74,15 @@ export class AIChatView extends ItemView {
 	currentSessionId: string | null = null;
 	includeFileContext: boolean = true;
 	fileContextHeader: HTMLElement;
-	currentClaudeProcess: ChildProcess | null = null;
 	isProcessing: boolean = false;
 	sendButton: HTMLButtonElement;
 	loadingIndicator: HTMLElement;
 
-	constructor(leaf: WorkspaceLeaf, settings: AIChatSettings) {
+	constructor(leaf: WorkspaceLeaf, settings: AIChatSettings, aiService: AIService, mcpManager: MCPManager) {
 		super(leaf);
 		this.settings = settings;
+		this.aiService = aiService;
+		this.mcpManager = mcpManager;
 	}
 
 	getViewType() {
@@ -98,10 +109,16 @@ export class AIChatView extends ItemView {
 		// Add header with new chat button
 		const headerEl = container.createEl('div', { cls: 'ai-chat-header' });
 		
-		headerEl.createEl('div', { 
+		// Add MCP status indicator
+		const titleContainer = headerEl.createEl('div', { cls: 'ai-title-container' });
+		titleContainer.createEl('div', { 
 			text: 'AI Agent',
 			cls: 'ai-chat-title'
 		});
+		
+		// MCP status badge
+		const mcpBadge = titleContainer.createEl('div', { cls: 'ai-mcp-badge' });
+		this.updateMCPBadge(mcpBadge);
 		
 		const buttonGroupEl = headerEl.createEl('div', { cls: 'ai-header-buttons' });
 		
@@ -221,6 +238,12 @@ export class AIChatView extends ItemView {
 
 	renderMessage(chatMessage: ChatMessage) {
 		try {
+			// Handle error messages with special rendering
+			if (chatMessage.type === 'error') {
+				this.renderErrorMessage(chatMessage);
+				return;
+			}
+
 			// Determine the CSS class based on message type and origin
 			let cssClass = 'ai-chat-message';
 			if (chatMessage.isUserInput) {
@@ -263,6 +286,72 @@ export class AIChatView extends ItemView {
 		} catch (error) {
 			console.error('Error rendering message:', error, chatMessage);
 		}
+	}
+
+	renderErrorMessage(chatMessage: ChatMessage) {
+		const errorContainer = this.messagesContainer.createEl('div', { cls: 'ai-error-message-container' });
+
+		// Error icon
+		const errorIcon = errorContainer.createEl('div', { cls: 'ai-error-icon' });
+		setIcon(errorIcon, 'alert-circle');
+
+		// Error content
+		const errorContent = errorContainer.createEl('div', { cls: 'ai-error-content' });
+
+		// Error title
+		const errorTitle = errorContent.createEl('div', { cls: 'ai-error-title' });
+		errorTitle.setText(chatMessage.errorDetails?.title || 'Error');
+
+		// Error message
+		const errorMessage = errorContent.createEl('div', { cls: 'ai-error-message' });
+		errorMessage.setText(chatMessage.errorDetails?.message || chatMessage.result || 'An error occurred');
+
+		// Toggle for showing details
+		if (chatMessage.errorDetails?.stack || chatMessage.errorDetails?.fullError) {
+			const toggleLink = errorContent.createEl('div', { cls: 'ai-error-toggle' });
+			toggleLink.setText('Show details');
+
+			// Error details (initially hidden)
+			const errorDetails = errorContent.createEl('div', { cls: 'ai-error-details collapsed' });
+			
+			let detailsText = '';
+			if (chatMessage.errorDetails?.stack) {
+				detailsText += `Stack trace:\n${chatMessage.errorDetails.stack}\n\n`;
+			}
+			if (chatMessage.errorDetails?.fullError) {
+				detailsText += `Full error:\n${JSON.stringify(chatMessage.errorDetails.fullError, null, 2)}`;
+			}
+			errorDetails.setText(detailsText);
+
+			// Toggle functionality
+			let isExpanded = false;
+			toggleLink.addEventListener('click', () => {
+				isExpanded = !isExpanded;
+				if (isExpanded) {
+					errorDetails.removeClass('collapsed');
+					toggleLink.setText('Hide details');
+				} else {
+					errorDetails.addClass('collapsed');
+					toggleLink.setText('Show details');
+				}
+			});
+
+			// Click on icon also toggles
+			errorIcon.addEventListener('click', () => {
+				toggleLink.click();
+			});
+		}
+
+		// Timestamp
+		if (chatMessage.timestamp) {
+			const timestampEl = errorContent.createEl('div', { cls: 'ai-message-timestamp' });
+			timestampEl.setText(chatMessage.timestamp.toLocaleTimeString());
+		}
+
+		// Auto scroll
+		requestAnimationFrame(() => {
+			this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
+		});
 	}
 
 	getDisplayName(type: string, isUserInput = false): string {
@@ -422,20 +511,17 @@ export class AIChatView extends ItemView {
 	}
 
 	cancelExecution() {
-		if (this.currentClaudeProcess) {
-			this.currentClaudeProcess.kill('SIGTERM');
-			this.currentClaudeProcess = null;
-			this.setProcessingState(false);
-			
-			const cancelMessage: ChatMessage = {
-				type: 'system',
-				result: 'Message execution cancelled',
-				session_id: this.currentSessionId || `session-${Date.now()}`,
-				uuid: `cancel-${Date.now()}`,
-				timestamp: new Date()
-			};
-			this.addMessage(cancelMessage);
-		}
+		this.aiService.cancel();
+		this.setProcessingState(false);
+
+		const cancelMessage: ChatMessage = {
+			type: 'system',
+			result: 'Message execution cancelled',
+			session_id: this.currentSessionId || `session-${Date.now()}`,
+			uuid: `cancel-${Date.now()}`,
+			timestamp: new Date()
+		};
+		this.addMessage(cancelMessage);
 	}
 
 	setProcessingState(processing: boolean) {
@@ -483,8 +569,8 @@ export class AIChatView extends ItemView {
 			// Debug logging if enabled
 			if (this.settings.debugContext) {
 				console.log('=== DEBUG CONTEXT START ===');
-				console.log('Node.js location:', this.settings.nodeLocation || 'auto-detect');
-				console.log('Claude location:', this.settings.claudeLocation || 'auto-detect');
+				console.log('Active provider:', this.settings.activeProvider);
+				console.log('Current model:', this.settings.providers[this.settings.activeProvider].model);
 				console.log('New message context:', {
 					originalMessage: messageText,
 					finalMessage: finalMessage,
@@ -518,212 +604,257 @@ export class AIChatView extends ItemView {
 	}
 
 	async executeCommand(prompt: string) {
-		return new Promise<void>((resolve) => {
-			const vaultPath = (this.app.vault.adapter as any).basePath;
-			
-			// Create echo process for prompt
-			const echoProcess = spawn('echo', [prompt], {
-				cwd: vaultPath,
-				env: { ...process.env, FORCE_COLOR: '0' }
-			});
-			
-			// Auto-detect command paths, using settings overrides if provided
-			const commands = CommandDetector.detectCommands(
-				this.settings?.nodeLocation,
-				this.settings?.claudeLocation
-			);
-			
-			let claudeProcess: ChildProcess;
-			
-			// Build claude command arguments
-			const claudeArgs = [
-				commands.claude,
-				'--output-format', 'stream-json',
-				'--permission-mode', 'bypassPermissions',
-				'--dangerously-skip-permissions',
-				'--verbose'
-			];
-			
-			if (this.currentSessionId) {
-				claudeArgs.push('--resume', this.currentSessionId);
-			}
+		return new Promise<void>(async (resolve, reject) => {
+			try {
+				// Use the AI service to send the message
+				const stream = await this.aiService.sendMessage(prompt, this.currentSessionId || undefined);
 
-			if (commands.isWSL) {
-				// For WSL, create the command array - let cwd handle the working directory like Linux/Mac
-				const fullArgs = [
-					...commands.wslPrefix!,
-					'--',
-					commands.node,
-					...claudeArgs
-				];
-				
-				this.currentClaudeProcess = spawn(fullArgs[0], fullArgs.slice(1), {
-					cwd: vaultPath,  // Same as Linux/Mac - let spawn handle the working directory
-					env: { ...process.env, FORCE_COLOR: '0' }
-				});
-				
-				claudeProcess = this.currentClaudeProcess;
-				
-				// For WSL, we need to pipe the prompt directly to stdin since we can't pipe between processes easily
-				if (this.currentClaudeProcess.stdin) {
-					this.currentClaudeProcess.stdin.write(prompt);
-					this.currentClaudeProcess.stdin.end();
+				// Process the streaming response
+				for await (const response of stream) {
+					this.processStreamingMessage(response);
 				}
-			} else {
-				// Normal execution for macOS/Linux
-				this.currentClaudeProcess = spawn(commands.node, claudeArgs, {
-					cwd: vaultPath,
-					env: { ...process.env, FORCE_COLOR: '0' }
-				});
+
+				resolve();
+			} catch (error) {
+				console.error('Error executing command:', error);
 				
-				// Pipe echo output to Claude
-				if (echoProcess.stdout && this.currentClaudeProcess.stdin) {
-					echoProcess.stdout.pipe(this.currentClaudeProcess.stdin);
-				}
-				
-				claudeProcess = this.currentClaudeProcess;
-			}
-			
-			let buffer = '';
-			
-			if (claudeProcess.stdout) {
-				claudeProcess.stdout.on('data', (chunk: Buffer) => {
-				buffer += chunk.toString();
-				
-				// Process complete JSON objects
-				const lines = buffer.split('\n');
-				buffer = lines.pop() || ''; // Keep incomplete line in buffer
-				
-				for (const line of lines) {
-					const trimmedLine = line.trim();
-					if (trimmedLine) {
-						try {
-							const jsonObj = JSON.parse(trimmedLine);
-							// Validate that we have a valid message structure
-							if (jsonObj && typeof jsonObj === 'object' && jsonObj.type) {
-								this.processStreamingMessage(jsonObj);
-							} else {
-								console.warn('Invalid message structure:', jsonObj);
-							}
-						} catch (parseError) {
-							console.warn('Failed to parse JSON line:', trimmedLine, parseError);
-							// Add error message to chat
-							const errorMessage: ChatMessage = {
-								type: 'system',
-								result: `Parse error: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
-								session_id: this.currentSessionId || `session-${Date.now()}`,
-								uuid: `error-${Date.now()}`,
-								timestamp: new Date()
-							};
-							this.addMessage(errorMessage);
-						}
-					}
-				}
-				});
-			}
-			
-			if (claudeProcess.stderr) {
-				claudeProcess.stderr.on('data', (chunk: Buffer) => {
-				const errorMessage: ChatMessage = {
-					type: 'system',
-					result: `Claude Error: ${chunk.toString()}`,
-					session_id: `session-${Date.now()}`,
-					uuid: `error-${Date.now()}`,
-					timestamp: new Date()
-				};
-				this.addMessage(errorMessage);
-				});
-			}
-			
-			claudeProcess.on('close', (code: number | null) => {
-				if (code !== 0 && code !== null) {
-					// Only show error if not cancelled (SIGTERM returns null)
-					const errorMessage: ChatMessage = {
-						type: 'system',
-						result: `Claude process exited with code ${code}`,
-						session_id: `session-${Date.now()}`,
-						uuid: `error-${Date.now()}`,
-						timestamp: new Date()
+				// Parse error details
+				let errorTitle = 'AI Service Error';
+				let errorMessage = 'An unexpected error occurred';
+				let errorStack = '';
+				let fullError = null;
+
+				if (error instanceof Error) {
+					errorMessage = error.message;
+					errorStack = error.stack || '';
+					fullError = {
+						name: error.name,
+						message: error.message,
+						stack: error.stack
 					};
-					this.addMessage(errorMessage);
+
+					// Detect specific error types
+					if (errorMessage.includes('403')) {
+						errorTitle = 'Authentication Error';
+						errorMessage = 'Invalid or expired API key. Please check your API key in settings.';
+					} else if (errorMessage.includes('404')) {
+						errorTitle = 'Model Not Found';
+						errorMessage = 'The selected model is not available. Please choose a different model in settings.';
+					} else if (errorMessage.includes('429')) {
+						errorTitle = 'Rate Limit Exceeded';
+						errorMessage = 'Too many requests. Please wait a moment and try again.';
+					} else if (errorMessage.includes('500') || errorMessage.includes('502') || errorMessage.includes('503')) {
+						errorTitle = 'Service Unavailable';
+						errorMessage = 'The AI service is temporarily unavailable. Please try again later.';
+					} else if (errorMessage.includes('Network') || errorMessage.includes('network')) {
+						errorTitle = 'Network Error';
+						errorMessage = 'Unable to connect to the AI service. Please check your internet connection.';
+					}
+				} else {
+					errorMessage = String(error);
+					fullError = error;
 				}
-				this.currentClaudeProcess = null;
-				resolve();
-			});
-			
-			claudeProcess.on('error', (error: Error) => {
-				const errorMessage: ChatMessage = {
-					type: 'system',
-					result: `Claude command failed: ${error.message}`,
-					session_id: `session-${Date.now()}`,
+
+				const errorChatMessage: ChatMessage = {
+					type: 'error',
+					result: errorMessage,
+					session_id: this.currentSessionId || `session-${Date.now()}`,
 					uuid: `error-${Date.now()}`,
-					timestamp: new Date()
+					timestamp: new Date(),
+					errorDetails: {
+						title: errorTitle,
+						message: errorMessage,
+						stack: errorStack,
+						fullError: fullError
+					}
 				};
-				this.addMessage(errorMessage);
+				
+				this.addMessage(errorChatMessage);
 				resolve();
-			});
+			}
 		});
 	}
 
-	processStreamingMessage(jsonObj: Partial<ChatMessage>) {
+	async processStreamingMessage(response: any) {
 		// Debug logging if enabled
 		if (this.settings.debugContext) {
 			console.log('=== STREAMING MESSAGE DEBUG ===');
-			console.log('Received streaming message:', jsonObj);
+			console.log('Received streaming message:', response);
 		}
-		
-		// Handle different types of streaming messages from Claude
-		if (jsonObj.type === 'system' && jsonObj.subtype === 'init') {
+
+		// Handle different types of streaming messages
+		if (response.type === 'system' && !response.content) {
 			// Store session_id for future resume
-			if (jsonObj.session_id && !this.currentSessionId) {
-				this.currentSessionId = jsonObj.session_id;
+			if (response.session_id && !this.currentSessionId) {
+				this.currentSessionId = response.session_id;
 			}
-			
+
 			// System initialization message - can be displayed or ignored
 			const systemMessage: ChatMessage = {
 				type: 'system',
 				subtype: 'init',
-				session_id: jsonObj.session_id || `session-${Date.now()}`,
+				session_id: response.session_id || `session-${Date.now()}`,
 				uuid: `system-${Date.now()}`,
 				timestamp: new Date()
 			};
 			this.addMessage(systemMessage);
-		} else if (jsonObj.type === 'assistant' && jsonObj.message) {
-			// Assistant message with content or tool use
-			const assistantMessage: ChatMessage = {
+		} else if (response.type === 'text' && response.content) {
+			// Text content - either assistant message or final result
+			if (response.is_error) {
+				// Error message
+				const errorMessage: ChatMessage = {
+					type: 'system',
+					result: `Error: ${response.content}`,
+					session_id: response.session_id || `session-${Date.now()}`,
+					uuid: `error-${Date.now()}`,
+					timestamp: new Date()
+				};
+				this.addMessage(errorMessage);
+			} else if (response.duration_ms) {
+				// Final result message
+				const resultMessage: ChatMessage = {
+					type: 'result',
+					subtype: 'success',
+					duration_ms: response.duration_ms,
+					duration_api_ms: response.duration_api_ms || 0,
+					is_error: false,
+					num_turns: 1,
+					result: response.content,
+					session_id: response.session_id || `session-${Date.now()}`,
+					total_cost_usd: response.total_cost_usd,
+					uuid: `result-${Date.now()}`,
+					timestamp: new Date()
+				};
+				this.addMessage(resultMessage);
+			} else {
+				// Assistant message
+				const assistantMessage: ChatMessage = {
+					type: 'assistant',
+					message: {
+						id: `msg-${Date.now()}`,
+						role: 'assistant',
+						content: [{ type: 'text', text: response.content }]
+					},
+					session_id: response.session_id || `session-${Date.now()}`,
+					uuid: `assistant-${Date.now()}`,
+					timestamp: new Date()
+				};
+				this.addMessage(assistantMessage);
+			}
+		} else if (response.type === 'tool_use' && response.tool_call) {
+			// Tool use message
+			const toolMessage: ChatMessage = {
 				type: 'assistant',
-				message: jsonObj.message,
-				session_id: jsonObj.session_id || `session-${Date.now()}`,
-				uuid: `assistant-${Date.now()}`,
+				message: {
+					id: `msg-${Date.now()}`,
+					role: 'assistant',
+					content: [{
+						type: 'tool_use',
+						id: response.tool_call.id,
+						name: response.tool_call.name,
+						input: response.tool_call.input
+					}]
+				},
+				session_id: response.session_id || `session-${Date.now()}`,
+				uuid: `tool-${Date.now()}`,
 				timestamp: new Date()
 			};
-			this.addMessage(assistantMessage);
-		} else if (jsonObj.type === 'user' && jsonObj.message) {
-			// Tool result messages (shown as user in stream but represent tool results)
+			this.addMessage(toolMessage);
+
+			// Execute the tool if it's from an MCP server
+			await this.executeMCPTool(response.tool_call);
+		} else if (response.type === 'tool_result' && response.tool_result) {
+			// Tool result message
 			const toolResultMessage: ChatMessage = {
 				type: 'user',
-				message: jsonObj.message,
-				session_id: jsonObj.session_id || `session-${Date.now()}`,
+				message: {
+					id: `msg-${Date.now()}`,
+					role: 'user',
+					content: [{
+						type: 'tool_result',
+						tool_use_id: response.tool_result.tool_use_id,
+						content: response.tool_result.content,
+						is_error: response.tool_result.is_error
+					}]
+				},
+				session_id: response.session_id || `session-${Date.now()}`,
 				uuid: `tool-result-${Date.now()}`,
 				timestamp: new Date()
 			};
 			this.addMessage(toolResultMessage);
-		} else if (jsonObj.type === 'result') {
-			// Final result message
-			const resultMessage: ChatMessage = {
-				type: 'result',
-				subtype: jsonObj.subtype || 'success',
-				duration_ms: jsonObj.duration_ms || 0,
-				duration_api_ms: jsonObj.duration_api_ms || 0,
-				is_error: jsonObj.is_error || false,
-				num_turns: jsonObj.num_turns || 1,
-				result: jsonObj.result,
-				session_id: jsonObj.session_id || `session-${Date.now()}`,
-				total_cost_usd: jsonObj.total_cost_usd,
-				uuid: `result-${Date.now()}`,
-				timestamp: new Date()
+		}
+	}
+
+	async executeMCPTool(toolCall: { id: string; name: string; input: Record<string, any> }): Promise<void> {
+		try {
+			console.log(`🔧 Executing MCP tool: ${toolCall.name}`, toolCall.input);
+			
+			// Find which server has this tool
+			const serverName = this.mcpManager.findServerForTool(toolCall.name);
+			
+			if (!serverName) {
+				console.error(`❌ No MCP server found for tool: ${toolCall.name}`);
+				return;
+			}
+
+			console.log(`📡 Found server for tool ${toolCall.name}: ${serverName}`);
+
+			// Execute the tool
+			const result = await this.mcpManager.executeTool(serverName, toolCall.name, toolCall.input);
+			console.log(`✅ Tool execution result:`, result);
+
+			// Send the result back to Gemini if using Gemini service
+			const activeProvider = this.settings.providers[this.settings.activeProvider];
+			if (activeProvider.provider === 'gemini' && activeProvider.enableFunctionCalling) {
+				console.log(`📤 Sending tool result back to Gemini...`);
+				// For Gemini, we need to send the function result back
+				if (typeof (this.aiService as any).sendFunctionResult === 'function') {
+					const resultStream = await (this.aiService as any).sendFunctionResult(toolCall.name, result);
+					
+					// Process the continued conversation
+					for await (const response of resultStream) {
+						this.processStreamingMessage(response);
+					}
+				}
+			} else {
+				// For Claude or other providers, show the result as a tool result message
+				const toolResultMessage: ChatMessage = {
+					type: 'user',
+					message: {
+						id: `msg-${Date.now()}`,
+						role: 'user',
+						content: [{
+							type: 'tool_result',
+							tool_use_id: toolCall.id,
+							content: JSON.stringify(result),
+							is_error: false
+						}]
+					},
+					session_id: this.currentSessionId || `session-${Date.now()}`,
+					uuid: `tool-result-${Date.now()}`,
+					timestamp: new Date()
+				};
+				this.addMessage(toolResultMessage);
+			}
+
+		} catch (error) {
+			console.error('Error executing MCP tool:', error);
+			
+			// Show error message
+			const errorMessage: ChatMessage = {
+				type: 'error',
+				result: `Failed to execute tool ${toolCall.name}`,
+				session_id: this.currentSessionId || `session-${Date.now()}`,
+				uuid: `error-${Date.now()}`,
+				timestamp: new Date(),
+				errorDetails: {
+					title: 'Tool Execution Error',
+					message: `Failed to execute tool: ${toolCall.name}`,
+					stack: error instanceof Error ? error.stack : undefined,
+					fullError: error
+				}
 			};
-			this.addMessage(resultMessage);
+			this.addMessage(errorMessage);
 		}
 	}
 
@@ -918,13 +1049,34 @@ export class AIChatView extends ItemView {
 
 	async onClose() {
 		// Cleanup when view is closed
-		if (this.currentClaudeProcess) {
-			this.currentClaudeProcess.kill('SIGTERM');
-			this.currentClaudeProcess = null;
-		}
+		this.aiService.cancel();
 	}
 
 	updateSettings(settings: AIChatSettings) {
 		this.settings = settings;
+	}
+
+	updateMCPBadge(badge: HTMLElement) {
+		const tools = this.mcpManager.getAllTools();
+		const servers = this.mcpManager.getRunningServers();
+		
+		if (servers.length > 0 && tools.length > 0) {
+			badge.setText(`MCP: ${servers.length} servers, ${tools.length} tools`);
+			badge.addClass('mcp-active');
+			
+			// Build detailed tooltip
+			let tooltip = `${servers.length} server(s) running:\n\n`;
+			servers.forEach(serverName => {
+				const serverTools = this.mcpManager.getServerTools(serverName);
+				tooltip += `• ${serverName}: ${serverTools.length} tools\n`;
+			});
+			tooltip += `\nTotal: ${tools.length} tools available`;
+			
+			badge.title = tooltip;
+		} else {
+			badge.setText('MCP: Off');
+			badge.addClass('mcp-inactive');
+			badge.title = 'No MCP servers configured. Go to Settings → MCP Servers';
+		}
 	}
 }

@@ -2,17 +2,61 @@ import { Plugin, WorkspaceLeaf } from 'obsidian';
 import { AIChatView, VIEW_TYPE_AI_CHAT } from './ChatView';
 import { AIChatSettingTab } from './SettingsTab';
 import { AIChatSettings, DEFAULT_SETTINGS } from './types';
+import { AIServiceFactory, MCPManager } from './services';
 
 export default class AIChatPlugin extends Plugin {
 	settings: AIChatSettings;
+	private aiService: any;
+	mcpManager: MCPManager; // Public so SettingsTab can access tool counts
 
 	async onload() {
 		await this.loadSettings();
 
+		// Initialize services
+		this.mcpManager = new MCPManager();
+
+		// Create AI service based on active provider
+		const activeConfig = this.settings.providers[this.settings.activeProvider];
+		this.aiService = AIServiceFactory.createService(activeConfig);
+
+		try {
+			await this.aiService.initialize(activeConfig);
+		} catch (error) {
+			console.error('Failed to initialize AI service:', error);
+		}
+
+		// Start MCP servers if configured
+		if (activeConfig.mcpServers && activeConfig.mcpServers.length > 0) {
+			for (const serverConfig of activeConfig.mcpServers) {
+				try {
+					await this.mcpManager.startServer(serverConfig);
+				} catch (error) {
+					console.error(`Failed to start MCP server ${serverConfig.name}:`, error);
+				}
+			}
+
+			// For Gemini with function calling enabled, pass MCP tools and server descriptions
+			if (activeConfig.provider === 'gemini' && activeConfig.enableFunctionCalling) {
+				const mcpTools = this.mcpManager.getAllTools();
+				
+				// Build server descriptions map
+				const serverDescriptions = new Map<string, string>();
+				for (const serverConfig of activeConfig.mcpServers) {
+					if (serverConfig.description) {
+						serverDescriptions.set(serverConfig.name, serverConfig.description);
+					}
+				}
+				
+				if (this.aiService && typeof (this.aiService as any).setMCPTools === 'function') {
+					(this.aiService as any).setMCPTools(mcpTools, serverDescriptions);
+				}
+			}
+		}
+
 		// Register the custom view
 		this.registerView(
 			VIEW_TYPE_AI_CHAT,
-			(leaf) => new AIChatView(leaf, this.settings)
+			(leaf) => new AIChatView(leaf, this.settings, this.aiService, this.mcpManager)
 		);
 
 		// Open the view in the right sidebar by default
@@ -24,14 +68,93 @@ export default class AIChatPlugin extends Plugin {
 			});
 		}
 
-
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new AIChatSettingTab(this.app, this));
 	}
 
 	onunload() {
+		// Stop all MCP servers
+		this.mcpManager.stopAllServers();
+
 		// Detach leaves with our view type when unloading
 		this.app.workspace.detachLeavesOfType(VIEW_TYPE_AI_CHAT);
+	}
+
+	/**
+	 * Update the active AI service when settings change
+	 */
+	async updateAIService(): Promise<void> {
+		const activeConfig = this.settings.providers[this.settings.activeProvider];
+
+		// Cancel any ongoing operations in the current service
+		if (this.aiService && typeof this.aiService.cancel === 'function') {
+			this.aiService.cancel();
+		}
+
+		// Create new service
+		this.aiService = AIServiceFactory.createService(activeConfig);
+
+		try {
+			await this.aiService.initialize(activeConfig);
+
+			// Update MCP servers
+			await this.updateMCPServers(activeConfig.mcpServers || []);
+
+			// For Gemini with function calling enabled, pass MCP tools
+			if (activeConfig.provider === 'gemini' && activeConfig.enableFunctionCalling) {
+				const mcpTools = this.mcpManager.getAllTools();
+				if (this.aiService && typeof (this.aiService as any).setMCPTools === 'function') {
+					(this.aiService as any).setMCPTools(mcpTools);
+				}
+			}
+
+		} catch (error) {
+			console.error('Failed to update AI service:', error);
+		}
+	}
+
+	/**
+	 * Update MCP servers for the current provider
+	 */
+	private async updateMCPServers(servers: any[]): Promise<void> {
+		// Stop servers that are no longer needed
+		const runningServers = this.mcpManager.getRunningServers();
+		for (const serverName of runningServers) {
+			const serverStillNeeded = servers.some(s => s.name === serverName);
+			if (!serverStillNeeded) {
+				await this.mcpManager.stopServer(serverName);
+			}
+		}
+
+		// Start new servers
+		for (const serverConfig of servers) {
+			const serverRunning = this.mcpManager.isServerRunning(serverConfig.name);
+			if (!serverRunning) {
+				try {
+					await this.mcpManager.startServer(serverConfig);
+				} catch (error) {
+					console.error(`Failed to start MCP server ${serverConfig.name}:`, error);
+				}
+			}
+		}
+
+		// Update MCP tools in Gemini service if applicable
+		const activeConfig = this.settings.providers[this.settings.activeProvider];
+		if (activeConfig.provider === 'gemini' && activeConfig.enableFunctionCalling) {
+			const mcpTools = this.mcpManager.getAllTools();
+			
+			// Build server descriptions map
+			const serverDescriptions = new Map<string, string>();
+			for (const serverConfig of servers) {
+				if (serverConfig.description) {
+					serverDescriptions.set(serverConfig.name, serverConfig.description);
+				}
+			}
+			
+			if (this.aiService && typeof (this.aiService as any).setMCPTools === 'function') {
+				(this.aiService as any).setMCPTools(mcpTools, serverDescriptions);
+			}
+		}
 	}
 
 	async activateView() {
