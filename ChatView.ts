@@ -4,6 +4,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { CommandDetector } from './commandDetector';
 import type { AIService } from './services/ai/AIService';
 import { MCPManager } from './services/mcp/MCPManager';
+import { ErrorHandler, ErrorCategory, type ErrorInfo } from './services/ErrorHandler';
 
 export const VIEW_TYPE_AI_CHAT = 'ai-chat-view';
 
@@ -40,7 +41,7 @@ interface Message {
 	};
 }
 
-interface ChatMessage {
+export interface ChatMessage {
 	type: "assistant" | "user" | "result" | "system" | "error";
 	message?: Message;
 	subtype?: "success" | "error" | "init";
@@ -66,6 +67,7 @@ export class AIChatView extends ItemView {
 	settings: AIChatSettings;
 	aiService: AIService;
 	mcpManager: MCPManager;
+	errorHandler: ErrorHandler;
 	messages: ChatMessage[] = [];
 	chatContainer: HTMLElement;
 	messagesContainer: HTMLElement;
@@ -77,12 +79,23 @@ export class AIChatView extends ItemView {
 	isProcessing: boolean = false;
 	sendButton: HTMLButtonElement;
 	loadingIndicator: HTMLElement;
+	connectionStatusEl: HTMLElement | null = null;
 
-	constructor(leaf: WorkspaceLeaf, settings: AIChatSettings, aiService: AIService, mcpManager: MCPManager) {
+	// Message editing state
+	editingMessageId: string | null = null;
+	originalMessageContent: string = '';
+
+	// Response regeneration state
+	lastUserMessage: string = '';
+	lastUserMessageIndex: number = -1;
+	regenerationCounts: Map<number, number> = new Map();
+
+	constructor(leaf: WorkspaceLeaf, settings: AIChatSettings, aiService: AIService, mcpManager: MCPManager, errorHandler?: ErrorHandler) {
 		super(leaf);
 		this.settings = settings;
 		this.aiService = aiService;
 		this.mcpManager = mcpManager;
+		this.errorHandler = errorHandler || new ErrorHandler();
 	}
 
 	getViewType() {
@@ -119,6 +132,13 @@ export class AIChatView extends ItemView {
 		// MCP status badge
 		const mcpBadge = titleContainer.createEl('div', { cls: 'ai-mcp-badge' });
 		this.updateMCPBadge(mcpBadge);
+
+		// Connection status badge (if enabled)
+		if (this.settings.errorHandling?.showConnectionStatus) {
+			this.connectionStatusEl = titleContainer.createEl('div', { cls: 'ai-connection-badge' });
+			this.updateConnectionStatusBadge();
+			this.errorHandler.onStatusChange(() => this.updateConnectionStatusBadge());
+		}
 		
 		const buttonGroupEl = headerEl.createEl('div', { cls: 'ai-header-buttons' });
 		
@@ -474,9 +494,222 @@ export class AIChatView extends ItemView {
 		this.renderMessageContent(contentEl, chatMessage);
 	}
 
-	renderFinalResponse(messageEl: HTMLElement, chatMessage: ChatMessage) {		
+	renderFinalResponse(messageEl: HTMLElement, chatMessage: ChatMessage) {
 		const contentEl = messageEl.createEl('div', { cls: 'ai-message-content ai-final-response' });
 		this.renderMessageContent(contentEl, chatMessage);
+
+		// Add action buttons for assistant result messages
+		const actionsEl = messageEl.createEl('div', { cls: 'ai-message-actions' });
+
+		// Regenerate button
+		const regenBtn = actionsEl.createEl('button', {
+			cls: 'ai-action-btn',
+			attr: { 'aria-label': 'Regenerate response', 'title': 'Regenerate' }
+		});
+		setIcon(regenBtn, 'refresh-cw');
+		regenBtn.addEventListener('click', () => this.regenerateResponse(chatMessage));
+
+		// Copy button
+		const copyBtn = actionsEl.createEl('button', {
+			cls: 'ai-action-btn',
+			attr: { 'aria-label': 'Copy response', 'title': 'Copy' }
+		});
+		setIcon(copyBtn, 'copy');
+		copyBtn.addEventListener('click', () => this.copyMessageContent(chatMessage));
+
+		// Show regeneration count if any
+		const regenCount = this.regenerationCounts.get(chatMessage.num_turns || 0) || 0;
+		if (regenCount > 0) {
+			const countEl = actionsEl.createEl('span', {
+				text: `↻ ${regenCount}`,
+				cls: 'ai-regen-count'
+			});
+			countEl.title = `Regenerated ${regenCount}/5 times`;
+		}
+	}
+
+	addMessageActions(messageEl: HTMLElement, chatMessage: ChatMessage) {
+		const actionsEl = messageEl.createEl('div', { cls: 'ai-message-actions' });
+
+		// Edit button
+		const editBtn = actionsEl.createEl('button', {
+			cls: 'ai-action-btn',
+			attr: { 'aria-label': 'Edit message', 'title': 'Edit' }
+		});
+		setIcon(editBtn, 'pencil');
+		editBtn.addEventListener('click', () => this.startEditingMessage(chatMessage));
+
+		// Regenerate button (only if this is the last user message and we have a response)
+		if (chatMessage.isUserInput && this.lastUserMessageIndex === this.messages.length - 1 && this.messages.length > 1) {
+			const regenBtn = actionsEl.createEl('button', {
+				cls: 'ai-action-btn',
+				attr: { 'aria-label': 'Regenerate response', 'title': 'Regenerate' }
+			});
+			setIcon(regenBtn, 'refresh-cw');
+			regenBtn.addEventListener('click', () => {
+				// Find the assistant response to this message and regenerate it
+				const lastResultIndex = this.messages.findLastIndex(
+					m => m.type === 'result' && this.messages.indexOf(m) > this.messages.indexOf(chatMessage)
+				);
+				if (lastResultIndex !== -1) {
+					this.regenerateResponse(this.messages[lastResultIndex]);
+				}
+			});
+		}
+
+		// Copy button
+		const copyBtn = actionsEl.createEl('button', {
+			cls: 'ai-action-btn',
+			attr: { 'aria-label': 'Copy message', 'title': 'Copy' }
+		});
+		setIcon(copyBtn, 'copy');
+		copyBtn.addEventListener('click', () => this.copyMessageContent(chatMessage));
+	}
+
+	startEditingMessage(chatMessage: ChatMessage) {
+		if (this.isProcessing) return;
+
+		// Extract text content from the message
+		let textContent = '';
+		if (chatMessage.message?.content) {
+			for (const block of chatMessage.message.content) {
+				if (block.type === 'text') {
+					textContent += block.text;
+				}
+			}
+		} else if (chatMessage.result) {
+			textContent = chatMessage.result;
+		}
+
+		this.editingMessageId = chatMessage.uuid;
+		this.originalMessageContent = textContent;
+		this.inputField.value = textContent;
+		this.inputField.focus();
+
+		// Add editing indicator
+		this.inputContainer.addClass('editing');
+		const editIndicator = this.inputContainer.createEl('div', {
+			text: 'Editing message - Press Enter to resend, Escape to cancel',
+			cls: 'ai-editing-indicator'
+		});
+
+		// Override Enter key to resend, Escape to cancel
+		const handleEditKeydown = (e: KeyboardEvent) => {
+			if (e.key === 'Enter' && !e.shiftKey) {
+				e.preventDefault();
+				this.saveEditedMessage();
+			} else if (e.key === 'Escape') {
+				this.cancelEditing();
+			}
+		};
+
+		this.inputField.addEventListener('keydown', handleEditKeydown);
+
+		// Store handler reference for cleanup
+		this.inputField.dataset.editHandler = 'true';
+	}
+
+	saveEditedMessage() {
+		if (!this.editingMessageId) return;
+
+		const editedContent = this.inputField.value.trim();
+		if (!editedContent) return;
+
+		// Find the message being edited
+		const msgIndex = this.messages.findIndex(m => m.uuid === this.editingMessageId);
+		if (msgIndex !== -1) {
+			// Update the message content
+			this.messages[msgIndex].message = {
+				...this.messages[msgIndex].message!,
+				content: [{ type: 'text', text: editedContent }]
+			};
+		}
+
+		// Clear editing state
+		this.cancelEditing();
+
+		// Resend the edited message
+		this.inputField.value = editedContent;
+		this.handleSendMessage();
+	}
+
+	cancelEditing() {
+		this.editingMessageId = null;
+		this.originalMessageContent = '';
+		this.inputContainer.removeClass('editing');
+
+		// Remove editing indicator
+		const indicator = this.inputContainer.querySelector('.ai-editing-indicator');
+		if (indicator) indicator.remove();
+
+		// Reset input field
+		this.inputField.value = '';
+	}
+
+	copyMessageContent(chatMessage: ChatMessage) {
+		let textContent = '';
+		if (chatMessage.message?.content) {
+			for (const block of chatMessage.message.content) {
+				if (block.type === 'text') {
+					textContent += block.text + '\n';
+				}
+			}
+		} else if (chatMessage.result) {
+			textContent = chatMessage.result;
+		}
+
+		navigator.clipboard.writeText(textContent.trim()).then(() => {
+			// Could show a toast notification here
+		}).catch(err => {
+			console.error('Failed to copy message:', err);
+		});
+	}
+
+	regenerateResponse(sourceMessage: ChatMessage) {
+		if (this.isProcessing || !this.lastUserMessage) return;
+
+		// Find regeneration count for this response
+		const currentCount = this.regenerationCounts.get(sourceMessage.num_turns || 0) || 0;
+		if (currentCount >= 5) {
+			// Max regenerations reached
+			const maxRegenMessage: ChatMessage = {
+				type: 'system',
+				result: 'Maximum regenerations (5) reached for this message.',
+				session_id: this.currentSessionId || `session-${Date.now()}`,
+				uuid: `max-regen-${Date.now()}`,
+				timestamp: new Date()
+			};
+			this.addMessage(maxRegenMessage);
+			return;
+		}
+
+		// Increment regeneration count
+		this.regenerationCounts.set(sourceMessage.num_turns || 0, currentCount + 1);
+
+		// Remove the old response and all messages after the last user message
+		if (this.lastUserMessageIndex !== -1) {
+			this.messages = this.messages.slice(0, this.lastUserMessageIndex + 1);
+			this.messagesContainer.empty();
+
+			// Re-render all messages
+			for (const msg of this.messages) {
+				this.renderMessage(msg);
+			}
+		}
+
+		// Re-send the last user message
+		const regenMessage: ChatMessage = {
+			type: 'system',
+			result: `Regenerating response (${currentCount + 1}/5)...`,
+			session_id: this.currentSessionId || `session-${Date.now()}`,
+			uuid: `regen-${Date.now()}`,
+			timestamp: new Date()
+		};
+		this.addMessage(regenMessage);
+
+		// Send the original message again
+		this.inputField.value = this.lastUserMessage;
+		this.handleSendMessage();
 	}
 
 	formatText(text: string): string {
@@ -595,6 +828,11 @@ export class AIChatView extends ItemView {
 			};
 			
 			this.addMessage(userMessage);
+
+			// Track last user message for regeneration
+			this.lastUserMessage = messageText;
+			this.lastUserMessageIndex = this.messages.length - 1;
+
 			this.inputField.value = '';
 			this.autoResizeTextarea(); // Reset height after clearing
 			this.setProcessingState(true);
@@ -605,72 +843,67 @@ export class AIChatView extends ItemView {
 
 	async executeCommand(prompt: string) {
 		return new Promise<void>(async (resolve, reject) => {
-			try {
-				// Use the AI service to send the message
-				const stream = await this.aiService.sendMessage(prompt, this.currentSessionId || undefined);
+			const errorHandling = this.settings.errorHandling;
+			const useRetry = errorHandling?.autoRetry !== false;
 
-				// Process the streaming response
-				for await (const response of stream) {
-					this.processStreamingMessage(response);
-				}
+			const processError = (error: Error, errorInfo: ErrorInfo) => {
+				this.errorHandler.setConnectionStatus('error');
 
-				resolve();
-			} catch (error) {
-				console.error('Error executing command:', error);
-				
-				// Parse error details
-				let errorTitle = 'AI Service Error';
-				let errorMessage = 'An unexpected error occurred';
-				let errorStack = '';
-				let fullError = null;
-
-				if (error instanceof Error) {
-					errorMessage = error.message;
-					errorStack = error.stack || '';
-					fullError = {
-						name: error.name,
-						message: error.message,
-						stack: error.stack
-					};
-
-					// Detect specific error types
-					if (errorMessage.includes('403')) {
-						errorTitle = 'Authentication Error';
-						errorMessage = 'Invalid or expired API key. Please check your API key in settings.';
-					} else if (errorMessage.includes('404')) {
-						errorTitle = 'Model Not Found';
-						errorMessage = 'The selected model is not available. Please choose a different model in settings.';
-					} else if (errorMessage.includes('429')) {
-						errorTitle = 'Rate Limit Exceeded';
-						errorMessage = 'Too many requests. Please wait a moment and try again.';
-					} else if (errorMessage.includes('500') || errorMessage.includes('502') || errorMessage.includes('503')) {
-						errorTitle = 'Service Unavailable';
-						errorMessage = 'The AI service is temporarily unavailable. Please try again later.';
-					} else if (errorMessage.includes('Network') || errorMessage.includes('network')) {
-						errorTitle = 'Network Error';
-						errorMessage = 'Unable to connect to the AI service. Please check your internet connection.';
-					}
-				} else {
-					errorMessage = String(error);
-					fullError = error;
-				}
-
+				const showDetails = errorHandling?.showDetailedErrors;
 				const errorChatMessage: ChatMessage = {
 					type: 'error',
-					result: errorMessage,
+					result: errorInfo.message,
 					session_id: this.currentSessionId || `session-${Date.now()}`,
 					uuid: `error-${Date.now()}`,
 					timestamp: new Date(),
 					errorDetails: {
-						title: errorTitle,
-						message: errorMessage,
-						stack: errorStack,
-						fullError: fullError
+						title: errorInfo.title,
+						message: errorInfo.message,
+						stack: showDetails ? error.stack : undefined,
+						fullError: showDetails ? error : undefined
 					}
 				};
-				
+
 				this.addMessage(errorChatMessage);
 				resolve();
+			};
+
+			const processRetry = (attempt: number, delayMs: number, error: Error) => {
+				const errorInfo = this.errorHandler.categorizeError(error);
+				const retryMessage: ChatMessage = {
+					type: 'system',
+					result: ErrorHandler.formatRetryCountdown(delayMs),
+					session_id: this.currentSessionId || `session-${Date.now()}`,
+					uuid: `retry-${Date.now()}`,
+					timestamp: new Date()
+				};
+				this.addMessage(retryMessage);
+			};
+
+			try {
+				const sendWithRetry = async () => {
+					const stream = await this.aiService.sendMessage(prompt, this.currentSessionId || undefined);
+					for await (const response of stream) {
+						this.processStreamingMessage(response);
+					}
+				};
+
+				if (useRetry) {
+					await this.errorHandler.withRetry(
+						sendWithRetry,
+						processRetry,
+						processError
+					);
+				} else {
+					await sendWithRetry();
+				}
+
+				this.errorHandler.setConnectionStatus('connected');
+				resolve();
+			} catch (error) {
+				const err = error instanceof Error ? error : new Error(String(error));
+				const errorInfo = this.errorHandler.categorizeError(err);
+				processError(err, errorInfo);
 			}
 		});
 	}
@@ -1059,11 +1292,11 @@ export class AIChatView extends ItemView {
 	updateMCPBadge(badge: HTMLElement) {
 		const tools = this.mcpManager.getAllTools();
 		const servers = this.mcpManager.getRunningServers();
-		
+
 		if (servers.length > 0 && tools.length > 0) {
 			badge.setText(`MCP: ${servers.length} servers, ${tools.length} tools`);
 			badge.addClass('mcp-active');
-			
+
 			// Build detailed tooltip
 			let tooltip = `${servers.length} server(s) running:\n\n`;
 			servers.forEach(serverName => {
@@ -1071,12 +1304,30 @@ export class AIChatView extends ItemView {
 				tooltip += `• ${serverName}: ${serverTools.length} tools\n`;
 			});
 			tooltip += `\nTotal: ${tools.length} tools available`;
-			
+
 			badge.title = tooltip;
 		} else {
 			badge.setText('MCP: Off');
 			badge.addClass('mcp-inactive');
 			badge.title = 'No MCP servers configured. Go to Settings → MCP Servers';
 		}
+	}
+
+	updateConnectionStatusBadge() {
+		if (!this.connectionStatusEl) return;
+
+		const status = this.errorHandler.getConnectionStatus();
+		this.connectionStatusEl.removeClass('connected', 'disconnected', 'error');
+		this.connectionStatusEl.addClass(status);
+
+		const statusText = status.charAt(0).toUpperCase() + status.slice(1);
+		this.connectionStatusEl.setText(statusText);
+
+		const titles: Record<string, string> = {
+			connected: 'Connected to AI service',
+			disconnected: 'Disconnected from AI service',
+			error: 'Connection error'
+		};
+		this.connectionStatusEl.title = titles[status] || status;
 	}
 }

@@ -2,18 +2,23 @@ import { Plugin, WorkspaceLeaf } from 'obsidian';
 import { AIChatView, VIEW_TYPE_AI_CHAT } from './ChatView';
 import { AIChatSettingTab } from './SettingsTab';
 import { AIChatSettings, DEFAULT_SETTINGS } from './types';
-import { AIServiceFactory, MCPManager } from './services';
+import { AIServiceFactory, MCPManager, ErrorHandler } from './services';
 
 export default class AIChatPlugin extends Plugin {
 	settings: AIChatSettings;
 	private aiService: any;
-	mcpManager: MCPManager; // Public so SettingsTab can access tool counts
+	mcpManager: MCPManager;
+	errorHandler: ErrorHandler;
 
 	async onload() {
 		await this.loadSettings();
 
 		// Initialize services
 		this.mcpManager = new MCPManager();
+		this.errorHandler = new ErrorHandler({
+			maxRetries: this.settings.errorHandling?.maxRetries || 3,
+			initialDelayMs: this.settings.errorHandling?.initialRetryDelayMs || 1000
+		});
 
 		// Create AI service based on active provider
 		const activeConfig = this.settings.providers[this.settings.activeProvider];
@@ -35,8 +40,8 @@ export default class AIChatPlugin extends Plugin {
 				}
 			}
 
-			// For Gemini with function calling enabled, pass MCP tools and server descriptions
-			if (activeConfig.provider === 'gemini' && activeConfig.enableFunctionCalling) {
+			// For API-based providers with function calling enabled, pass MCP tools and server descriptions
+			if ((activeConfig.provider === 'gemini' || activeConfig.provider === 'openrouter') && activeConfig.enableFunctionCalling) {
 				const mcpTools = this.mcpManager.getAllTools();
 				
 				// Build server descriptions map
@@ -56,7 +61,7 @@ export default class AIChatPlugin extends Plugin {
 		// Register the custom view
 		this.registerView(
 			VIEW_TYPE_AI_CHAT,
-			(leaf) => new AIChatView(leaf, this.settings, this.aiService, this.mcpManager)
+			(leaf) => new AIChatView(leaf, this.settings, this.aiService, this.mcpManager, this.errorHandler)
 		);
 
 		// Open the view in the right sidebar by default
@@ -100,8 +105,8 @@ export default class AIChatPlugin extends Plugin {
 			// Update MCP servers
 			await this.updateMCPServers(activeConfig.mcpServers || []);
 
-			// For Gemini with function calling enabled, pass MCP tools
-			if (activeConfig.provider === 'gemini' && activeConfig.enableFunctionCalling) {
+			// For API-based providers with function calling enabled, pass MCP tools
+			if ((activeConfig.provider === 'gemini' || activeConfig.provider === 'openrouter') && activeConfig.enableFunctionCalling) {
 				const mcpTools = this.mcpManager.getAllTools();
 				if (this.aiService && typeof (this.aiService as any).setMCPTools === 'function') {
 					(this.aiService as any).setMCPTools(mcpTools);
@@ -138,9 +143,9 @@ export default class AIChatPlugin extends Plugin {
 			}
 		}
 
-		// Update MCP tools in Gemini service if applicable
+		// Update MCP tools in API-based services if applicable
 		const activeConfig = this.settings.providers[this.settings.activeProvider];
-		if (activeConfig.provider === 'gemini' && activeConfig.enableFunctionCalling) {
+		if ((activeConfig.provider === 'gemini' || activeConfig.provider === 'openrouter') && activeConfig.enableFunctionCalling) {
 			const mcpTools = this.mcpManager.getAllTools();
 			
 			// Build server descriptions map

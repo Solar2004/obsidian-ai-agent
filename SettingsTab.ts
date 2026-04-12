@@ -21,6 +21,7 @@ export class AIChatSettingTab extends PluginSettingTab {
 			.addDropdown(dropdown => {
 				dropdown.addOption('claude', 'Claude');
 				dropdown.addOption('gemini', 'Gemini');
+				dropdown.addOption('openrouter', 'OpenRouter / Custom OpenAI');
 				dropdown.setValue(this.plugin.settings.activeProvider);
 				dropdown.onChange(async (value: AIProvider) => {
 					this.plugin.settings.activeProvider = value;
@@ -80,6 +81,35 @@ export class AIChatSettingTab extends PluginSettingTab {
 					}));
 		}
 
+		// OpenRouter / Custom API Settings
+		if (activeProvider === 'openrouter') {
+			containerEl.createEl('h3', { text: 'OpenRouter / Custom API Settings' });
+
+			new Setting(containerEl)
+				.setName('API Key')
+				.setDesc('Your API key for OpenRouter or other OpenAI-compatible API')
+				.addText(text => text
+					.setPlaceholder('sk-or-v1...')
+					.setValue(activeConfig.apiKey || '')
+					.onChange(async (value) => {
+						activeConfig.apiKey = value;
+						await this.plugin.saveSettings();
+						await this.plugin.updateAIService();
+					}));
+
+			new Setting(containerEl)
+				.setName('Base URL')
+				.setDesc('API base URL (defaults to OpenRouter). For custom OpenAI-compatible APIs.')
+				.addText(text => text
+					.setPlaceholder('https://openrouter.ai/api/v1')
+					.setValue(activeConfig.baseUrl || '')
+					.onChange(async (value) => {
+						activeConfig.baseUrl = value;
+						await this.plugin.saveSettings();
+						await this.plugin.updateAIService();
+					}));
+		}
+
 		// Model Selection
 		containerEl.createEl('h3', { text: 'Model Settings' });
 
@@ -87,9 +117,34 @@ export class AIChatSettingTab extends PluginSettingTab {
 			.setName('AI Model')
 			.setDesc('Select which model to use')
 			.addDropdown(dropdown => {
-				const availableModels = activeProvider === 'claude'
-					? ['claude-sonnet-4-20250514', 'claude-sonnet-4-20241022', 'claude-opus-4-20250514', 'claude-haiku-3.5-20241022']
-					: ['gemini-2.5-pro-latest', 'gemini-2.5-flash-latest', 'gemini-2.0-flash-exp', 'gemini-1.5-pro-latest', 'gemini-1.5-flash-latest'];
+				let availableModels: string[] = [];
+
+				if (activeProvider === 'claude') {
+					availableModels = [
+						'claude-sonnet-4-20250514',
+						'claude-sonnet-4-20241022',
+						'claude-opus-4-20250514',
+						'claude-haiku-3.5-20241022'
+					];
+				} else if (activeProvider === 'gemini') {
+					availableModels = [
+						'gemini-2.5-pro-latest',
+						'gemini-2.5-flash-latest',
+						'gemini-2.0-flash-exp',
+						'gemini-1.5-pro-latest',
+						'gemini-1.5-flash-latest'
+					];
+				} else if (activeProvider === 'openrouter') {
+					availableModels = [
+						'openrouter/auto',
+						'openrouter/anthropic/claude-3.5-sonnet',
+						'openrouter/anthropic/claude-3-haiku',
+						'openrouter/openai/gpt-4o',
+						'openrouter/google/gemini-2.0-flash',
+						'openrouter/mistral/mistral-large',
+						'openrouter/deepseek/deepseek-chat'
+					];
+				}
 
 				availableModels.forEach(model => {
 					dropdown.addOption(model, model);
@@ -103,11 +158,11 @@ export class AIChatSettingTab extends PluginSettingTab {
 				});
 			});
 
-		// Function Calling Toggle for Gemini
-		if (activeProvider === 'gemini') {
+		// Function Calling Toggle for API providers
+		if (activeProvider === 'gemini' || activeProvider === 'openrouter') {
 			new Setting(containerEl)
 				.setName('Enable Function Calling for MCP')
-				.setDesc('Allow Gemini to use MCP tools via function calling. Only works when MCP servers are configured below.')
+				.setDesc('Allow the AI to use MCP tools via function calling. Only works when MCP servers are configured below.')
 				.addToggle(toggle => toggle
 					.setValue(activeConfig.enableFunctionCalling || false)
 					.onChange(async (value) => {
@@ -151,18 +206,125 @@ export class AIChatSettingTab extends PluginSettingTab {
 				}));
 
 		// Debug Settings
-		containerEl.createEl('h3', { text: 'Debug' });
+			containerEl.createEl('h3', { text: 'Debug' });
 
-		new Setting(containerEl)
-			.setName('Debug Context')
-			.setDesc('Enable debug logging for troubleshooting (logs to console).')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.debugContext || false)
-				.onChange(async (value) => {
-					this.plugin.settings.debugContext = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+			new Setting(containerEl)
+				.setName('Debug Context')
+				.setDesc('Enable debug logging for troubleshooting (logs to console).')
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.debugContext || false)
+					.onChange(async (value) => {
+						this.plugin.settings.debugContext = value;
+						await this.plugin.saveSettings();
+					}));
+
+			// Error Handling Settings
+			containerEl.createEl('h3', { text: 'Error Handling' });
+
+			const errorHandling = this.plugin.settings.errorHandling || {
+				showDetailedErrors: false,
+				autoRetry: true,
+				maxRetries: 3,
+				initialRetryDelayMs: 1000,
+				showConnectionStatus: true,
+				timeoutSeconds: 60
+			};
+
+			new Setting(containerEl)
+				.setName('Show Detailed Errors')
+				.setDesc('Show full error details and stack traces for debugging.')
+				.addToggle(toggle => toggle
+					.setValue(errorHandling.showDetailedErrors || false)
+					.onChange(async (value) => {
+						errorHandling.showDetailedErrors = value;
+						this.plugin.settings.errorHandling = errorHandling;
+						await this.plugin.saveSettings();
+					}));
+
+			new Setting(containerEl)
+				.setName('Auto-Retry Failed Requests')
+				.setDesc('Automatically retry failed requests with exponential backoff.')
+				.addToggle(toggle => toggle
+					.setValue(errorHandling.autoRetry !== false)
+					.onChange(async (value) => {
+						errorHandling.autoRetry = value;
+						this.plugin.settings.errorHandling = errorHandling;
+						await this.plugin.saveSettings();
+					}));
+
+			new Setting(containerEl)
+				.setName('Retry Count')
+				.setDesc('Number of retry attempts for failed requests.')
+				.addDropdown(dropdown => {
+					dropdown.addOption('1', '1');
+					dropdown.addOption('2', '2');
+					dropdown.addOption('3', '3');
+					dropdown.addOption('5', '5');
+					dropdown.setValue(String(errorHandling.maxRetries || 3));
+					dropdown.onChange(async (value) => {
+						errorHandling.maxRetries = parseInt(value, 10);
+						this.plugin.settings.errorHandling = errorHandling;
+						await this.plugin.saveSettings();
+					});
+				});
+
+			new Setting(containerEl)
+				.setName('Show Connection Status')
+				.setDesc('Display connection status indicator in the chat header.')
+				.addToggle(toggle => toggle
+					.setValue(errorHandling.showConnectionStatus !== false)
+					.onChange(async (value) => {
+						errorHandling.showConnectionStatus = value;
+						this.plugin.settings.errorHandling = errorHandling;
+						await this.plugin.saveSettings();
+					}));
+
+			// Chat UI Settings
+			containerEl.createEl('h3', { text: 'Chat UI' });
+
+			const chatUi = this.plugin.settings.chatUi || {
+				enableMessageEditing: true,
+				enableRegeneration: true,
+				maxRegenerations: 5
+			};
+
+			new Setting(containerEl)
+				.setName('Enable Message Editing')
+				.setDesc('Allow editing sent messages and resending.')
+				.addToggle(toggle => toggle
+					.setValue(chatUi.enableMessageEditing !== false)
+					.onChange(async (value) => {
+						chatUi.enableMessageEditing = value;
+						this.plugin.settings.chatUi = chatUi;
+						await this.plugin.saveSettings();
+					}));
+
+			new Setting(containerEl)
+				.setName('Enable Response Regeneration')
+				.setDesc('Allow regenerating AI responses (max 5 per message).')
+				.addToggle(toggle => toggle
+					.setValue(chatUi.enableRegeneration !== false)
+					.onChange(async (value) => {
+						chatUi.enableRegeneration = value;
+						this.plugin.settings.chatUi = chatUi;
+						await this.plugin.saveSettings();
+					}));
+
+			new Setting(containerEl)
+				.setName('Max Regenerations')
+				.setDesc('Maximum number of regeneration attempts per message.')
+				.addDropdown(dropdown => {
+					dropdown.addOption('3', '3');
+					dropdown.addOption('5', '5');
+					dropdown.addOption('10', '10');
+					dropdown.setValue(String(chatUi.maxRegenerations || 5));
+					dropdown.onChange(async (value) => {
+						chatUi.maxRegenerations = parseInt(value, 10);
+						this.plugin.settings.chatUi = chatUi;
+						await this.plugin.saveSettings();
+					});
+				});
+		}
 
 	private createMCPServerSetting(container: HTMLElement, server: MCPServer, index: number): void {
 		const serverContainer = container.createEl('div', { cls: 'mcp-server-setting' });
