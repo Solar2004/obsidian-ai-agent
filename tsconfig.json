@@ -20,5 +20,9 @@
   },
   "include": [
     "**/*.ts"
+  ],
+  "exclude": [
+    "nodepad-main",
+    "node_modules"
   ]
 }

@@ -90,6 +90,10 @@ export class AIChatView extends ItemView {
 	lastUserMessageIndex: number = -1;
 	regenerationCounts: Map<number, number> = new Map();
 
+	// Streaming buffer for aggregating text chunks
+	private streamingBuffer: Map<string, { text: string; timeout: number | null; element: HTMLElement | null }> = new Map();
+	private readonly STREAMING_DELAY_MS = 50;
+
 	constructor(leaf: WorkspaceLeaf, settings: AIChatSettings, aiService: AIService, mcpManager: MCPManager, errorHandler?: ErrorHandler) {
 		super(leaf);
 		this.settings = settings;
@@ -713,12 +717,177 @@ export class AIChatView extends ItemView {
 	}
 
 	formatText(text: string): string {
-		// Basic markdown-like formatting
-		return text
-			.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-			.replace(/\*(.*?)\*/g, '<em>$1</em>')
-			.replace(/`(.*?)`/g, '<code>$1</code>')
-			.replace(/\n/g, '<br>');
+		if (!text) return '';
+
+		// Escape HTML first to prevent XSS
+		let result = text
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;');
+
+		// Process code blocks first (```...```)
+		result = result.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+			return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
+		});
+
+		// Process inline code (`...`)
+		result = result.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+		// Process bold (**...**)
+		result = result.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+
+		// Process italic (*...* and _..._)
+		result = result.replace(/\*(.*?)\*/g, '<em>$1</em>');
+		result = result.replace(/_([^_]+)_/g, '<em>$1</em>');
+
+		// Process headers (# ## ### etc)
+		result = result.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+		result = result.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+		result = result.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+
+		// Process blockquotes (> ...)
+		result = result.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+
+		// Process horizontal rules (--- or *** or ___)
+		result = result.replace(/^([-_*]{3,})$/gm, '<hr>');
+
+		// Process links [text](url)
+		result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+		// Handle paragraph breaks (double newlines or more) vs line breaks (single newlines)
+		// Split on 2+ newlines for paragraphs
+		const paragraphBlocks = result.split(/\n{2,}/);
+		result = paragraphBlocks.map(para => {
+			para = para.trim();
+			if (!para) return '';
+			// Check if it's a block element
+			if (/^<(?:pre|blockquote|h[1-4]|hr|ul|ol)\b/.test(para)) {
+				return para;
+			}
+			// Convert remaining single newlines to <br>
+			para = para.replace(/\n/g, '<br>');
+			return `<p>${para}</p>`;
+		}).join('\n');
+
+		return result;
+	}
+
+	// ── Streaming Buffer Management ───────────────────────────────────────────
+
+	/**
+	 * Append text to the streaming buffer and schedule a UI update.
+	 * This prevents word-by-word rendering by batching updates.
+	 */
+	private appendToStreamingBuffer(text: string): void {
+		const sessionId = this.currentSessionId || 'default';
+		let buffer = this.streamingBuffer.get(sessionId);
+
+		if (!buffer) {
+			// Create new streaming message
+			const assistantMessage: ChatMessage = {
+				type: 'assistant',
+				message: {
+					id: `msg-${Date.now()}`,
+					role: 'assistant',
+					content: [{ type: 'text', text: '' }]
+				},
+				session_id: sessionId,
+				uuid: `assistant-${Date.now()}`,
+				timestamp: new Date()
+			};
+			this.addMessage(assistantMessage);
+
+			// Get the last message element (the one we just added)
+			const messages = this.messagesContainer.querySelectorAll('.ai-chat-message-assistant');
+			const lastElement = messages[messages.length - 1] as HTMLElement | undefined;
+
+			buffer = { text: '', timeout: null, element: lastElement || null };
+			this.streamingBuffer.set(sessionId, buffer);
+		}
+
+		// Accumulate text
+		buffer.text += text;
+
+		// Schedule UI update (debounced)
+		if (buffer.timeout !== null) {
+			clearTimeout(buffer.timeout);
+		}
+
+		buffer.timeout = window.setTimeout(() => {
+			this.updateStreamingDisplay(sessionId);
+		}, this.STREAMING_DELAY_MS);
+	}
+
+	/**
+	 * Update the streaming message display with accumulated text
+	 */
+	private updateStreamingDisplay(sessionId: string): void {
+		const buffer = this.streamingBuffer.get(sessionId);
+		if (!buffer || !buffer.element) return;
+
+		// Find the message in our messages array and update it
+		const lastMsgIndex = this.messages.findLastIndex(m => m.type === 'assistant' && m.session_id === sessionId);
+		if (lastMsgIndex !== -1) {
+			const msg = this.messages[lastMsgIndex];
+			if (msg.message?.content?.[0]?.type === 'text') {
+				msg.message.content[0].text = buffer.text;
+				msg.timestamp = new Date();
+			}
+		}
+
+		// Update the DOM element
+		const textEl = buffer.element.querySelector('.ai-message-text');
+		if (textEl) {
+			textEl.innerHTML = this.formatText(buffer.text);
+		}
+
+		// Scroll to bottom
+		requestAnimationFrame(() => {
+			this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
+		});
+
+		buffer.timeout = null;
+	}
+
+	/**
+	 * Finish streaming - convert accumulated text to final result
+	 */
+	private finishStreamingMessage(content: string, response: any): void {
+		const sessionId = this.currentSessionId || 'default';
+		const buffer = this.streamingBuffer.get(sessionId);
+
+		// Clear any pending timeout
+		if (buffer && buffer.timeout !== null) {
+			clearTimeout(buffer.timeout);
+		}
+
+		// Remove the streaming assistant message if it exists
+		if (buffer?.element) {
+			const msgIndex = this.messages.findLastIndex(m => m.type === 'assistant' && m.session_id === sessionId);
+			if (msgIndex !== -1) {
+				this.messages.splice(msgIndex, 1);
+			}
+			buffer.element.remove();
+		}
+
+		// Clear the buffer
+		this.streamingBuffer.delete(sessionId);
+
+		// Create final result message
+		const resultMessage: ChatMessage = {
+			type: 'result',
+			subtype: 'success',
+			duration_ms: response.duration_ms,
+			duration_api_ms: response.duration_api_ms || 0,
+			is_error: false,
+			num_turns: 1,
+			result: content,
+			session_id: sessionId,
+			total_cost_usd: response.total_cost_usd,
+			uuid: `result-${Date.now()}`,
+			timestamp: new Date()
+		};
+		this.addMessage(resultMessage);
 	}
 
 	getCurrentFilePath(): string | null {
@@ -944,35 +1113,11 @@ export class AIChatView extends ItemView {
 				};
 				this.addMessage(errorMessage);
 			} else if (response.duration_ms) {
-				// Final result message
-				const resultMessage: ChatMessage = {
-					type: 'result',
-					subtype: 'success',
-					duration_ms: response.duration_ms,
-					duration_api_ms: response.duration_api_ms || 0,
-					is_error: false,
-					num_turns: 1,
-					result: response.content,
-					session_id: response.session_id || `session-${Date.now()}`,
-					total_cost_usd: response.total_cost_usd,
-					uuid: `result-${Date.now()}`,
-					timestamp: new Date()
-				};
-				this.addMessage(resultMessage);
+				// Final result message - replace any pending streaming message
+				this.finishStreamingMessage(response.content, response);
 			} else {
-				// Assistant message
-				const assistantMessage: ChatMessage = {
-					type: 'assistant',
-					message: {
-						id: `msg-${Date.now()}`,
-						role: 'assistant',
-						content: [{ type: 'text', text: response.content }]
-					},
-					session_id: response.session_id || `session-${Date.now()}`,
-					uuid: `assistant-${Date.now()}`,
-					timestamp: new Date()
-				};
-				this.addMessage(assistantMessage);
+				// Streaming text - accumulate in buffer then update display
+				this.appendToStreamingBuffer(response.content);
 			}
 		} else if (response.type === 'tool_use' && response.tool_call) {
 			// Tool use message
@@ -1282,11 +1427,17 @@ export class AIChatView extends ItemView {
 
 	async onClose() {
 		// Cleanup when view is closed
-		this.aiService.cancel();
+		if (this.aiService && typeof this.aiService.cancel === 'function') {
+			this.aiService.cancel();
+		}
 	}
 
 	updateSettings(settings: AIChatSettings) {
 		this.settings = settings;
+	}
+
+	updateAIService(aiService: AIService) {
+		this.aiService = aiService;
 	}
 
 	updateMCPBadge(badge: HTMLElement) {

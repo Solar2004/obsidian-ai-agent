@@ -113,9 +113,34 @@ export class AIChatSettingTab extends PluginSettingTab {
 		// Model Selection
 		containerEl.createEl('h3', { text: 'Model Settings' });
 
+		// Check if current model is a custom model (not in predefined lists)
+		const isCustomModel = (model: string): boolean => {
+			const predefinedModels: string[] = [
+				'claude-sonnet-4-20250514',
+				'claude-sonnet-4-20241022',
+				'claude-opus-4-20250514',
+				'claude-haiku-3.5-20241022',
+				'gemini-2.5-pro-latest',
+				'gemini-2.5-flash-latest',
+				'gemini-2.0-flash-exp',
+				'gemini-1.5-pro-latest',
+				'gemini-1.5-flash-latest',
+				'openrouter/auto',
+				'openrouter/anthropic/claude-3.5-sonnet',
+				'openrouter/anthropic/claude-3-haiku',
+				'openrouter/openai/gpt-4o',
+				'openrouter/google/gemini-2.0-flash',
+				'openrouter/mistral/mistral-large',
+				'openrouter/deepseek/deepseek-chat'
+			];
+			return !predefinedModels.includes(model);
+		};
+
+		const currentModel = activeConfig.model || '';
+
 		new Setting(containerEl)
 			.setName('AI Model')
-			.setDesc('Select which model to use')
+			.setDesc('Select a predefined model or choose Custom to enter any model name')
 			.addDropdown(dropdown => {
 				let availableModels: string[] = [];
 
@@ -150,13 +175,44 @@ export class AIChatSettingTab extends PluginSettingTab {
 					dropdown.addOption(model, model);
 				});
 
-				dropdown.setValue(activeConfig.model);
+				// Add Custom option
+				dropdown.addOption('__custom__', 'Custom...');
+
+				// Set current value - if it's a custom model, show 'custom'
+				if (isCustomModel(currentModel)) {
+					dropdown.setValue('__custom__');
+				} else {
+					dropdown.setValue(currentModel);
+				}
+
 				dropdown.onChange(async (value: AIModel) => {
-					activeConfig.model = value;
-					await this.plugin.saveSettings();
-					await this.plugin.updateAIService();
+					if (value === '__custom__') {
+						// Save '__custom__' as marker so we show the input on refresh
+						activeConfig.model = '__custom__';
+						await this.plugin.saveSettings();
+						this.display(); // Refresh to show custom input
+					} else {
+						activeConfig.model = value;
+						await this.plugin.saveSettings();
+						await this.plugin.updateAIService();
+					}
 				});
 			});
+
+		// Custom model text input (shown when custom is selected)
+		if (isCustomModel(currentModel)) {
+			new Setting(containerEl)
+				.setName('Custom Model Name')
+				.setDesc('Enter any model name (e.g., anthropic/claude-3-5-sonnet, gpt-4o, deepseek-chat)')
+				.addText(text => text
+					.setPlaceholder('e.g., anthropic/claude-3-5-sonnet')
+					.setValue(currentModel === '__custom__' ? '' : currentModel)
+					.onChange(async (value) => {
+						activeConfig.model = value;
+						await this.plugin.saveSettings();
+						await this.plugin.updateAIService();
+					}));
+		}
 
 		// Function Calling Toggle for API providers
 		if (activeProvider === 'gemini' || activeProvider === 'openrouter') {
@@ -216,6 +272,42 @@ export class AIChatSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.debugContext = value;
 						await this.plugin.saveSettings();
+					}));
+
+			// Diagnostic Info - Copy current settings for debugging
+			new Setting(containerEl)
+				.setName('Copy Diagnostic Info')
+				.setDesc('Copy all current provider settings (API key hidden) for debugging.')
+				.addButton(button => button
+					.setButtonText('Copy Settings')
+					.onClick(async () => {
+						const activeProvider = this.plugin.settings.activeProvider;
+						const config = this.plugin.settings.providers[activeProvider];
+
+						// Create a safe copy with masked API key
+						const diagnosticInfo = {
+							activeProvider: activeProvider,
+							baseUrl: config.baseUrl || '(default)',
+							model: config.model,
+							enableFunctionCalling: config.enableFunctionCalling || false,
+							mcpServersCount: config.mcpServers?.length || 0,
+							apiKeyPrefix: config.apiKey ? config.apiKey.substring(0, 8) + '...' : '(empty)',
+							// Add normalized model (what OpenRouter actually receives)
+							normalizedModel: activeProvider === 'openrouter' ?
+								config.model?.replace(/^openrouter\//, '') || config.model : config.model
+						};
+
+						const jsonStr = JSON.stringify(diagnosticInfo, null, 2);
+						try {
+							await navigator.clipboard.writeText(jsonStr);
+							// Show brief confirmation
+							button.setButtonText('Copied!');
+							setTimeout(() => button.setButtonText('Copy Settings'), 2000);
+						} catch (e) {
+							console.error('Failed to copy:', e);
+							button.setButtonText('Failed to copy');
+							setTimeout(() => button.setButtonText('Copy Settings'), 2000);
+						}
 					}));
 
 			// Error Handling Settings

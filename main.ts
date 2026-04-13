@@ -1,5 +1,6 @@
 import { Plugin, WorkspaceLeaf } from 'obsidian';
 import { AIChatView, VIEW_TYPE_AI_CHAT } from './ChatView';
+import { NodepadView, VIEW_TYPE_NODEPAD } from './NodepadView';
 import { AIChatSettingTab } from './SettingsTab';
 import { AIChatSettings, DEFAULT_SETTINGS } from './types';
 import { AIServiceFactory, MCPManager, ErrorHandler } from './services';
@@ -9,6 +10,7 @@ export default class AIChatPlugin extends Plugin {
 	private aiService: any;
 	mcpManager: MCPManager;
 	errorHandler: ErrorHandler;
+	private chatView: AIChatView | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -61,8 +63,26 @@ export default class AIChatPlugin extends Plugin {
 		// Register the custom view
 		this.registerView(
 			VIEW_TYPE_AI_CHAT,
-			(leaf) => new AIChatView(leaf, this.settings, this.aiService, this.mcpManager, this.errorHandler)
+			(leaf) => this.chatView = new AIChatView(leaf, this.settings, this.aiService, this.mcpManager, this.errorHandler)
 		);
+
+		// Register Nodepad view
+		this.registerView(
+			VIEW_TYPE_NODEPAD,
+			(leaf) => new NodepadView(leaf, this.settings)
+		);
+
+		// Ribbon icon for Nodepad
+		this.addRibbonIcon('layout-grid', 'Open Nodepad', () => {
+			this.activateNodepadView();
+		});
+
+		// Command to open Nodepad
+		this.addCommand({
+			id: 'open-nodepad',
+			name: 'Open Nodepad',
+			callback: () => this.activateNodepadView(),
+		});
 
 		// Open the view in the right sidebar by default
 		if (this.app.workspace.layoutReady) {
@@ -81,8 +101,9 @@ export default class AIChatPlugin extends Plugin {
 		// Stop all MCP servers
 		this.mcpManager.stopAllServers();
 
-		// Detach leaves with our view type when unloading
+		// Detach leaves with our view types when unloading
 		this.app.workspace.detachLeavesOfType(VIEW_TYPE_AI_CHAT);
+		this.app.workspace.detachLeavesOfType(VIEW_TYPE_NODEPAD);
 	}
 
 	/**
@@ -113,8 +134,17 @@ export default class AIChatPlugin extends Plugin {
 				}
 			}
 
+			// Update the chat view with the new service
+			if (this.chatView) {
+				this.chatView.updateAIService(this.aiService);
+			}
+
 		} catch (error) {
 			console.error('Failed to update AI service:', error);
+			// Still update the chat view with the new service so it can show proper errors
+			if (this.chatView) {
+				this.chatView.updateAIService(this.aiService);
+			}
 		}
 	}
 
@@ -160,6 +190,21 @@ export default class AIChatPlugin extends Plugin {
 				(this.aiService as any).setMCPTools(mcpTools, serverDescriptions);
 			}
 		}
+	}
+
+	async activateNodepadView() {
+		const { workspace } = this.app;
+		let leaf: WorkspaceLeaf | null = null;
+		const leaves = workspace.getLeavesOfType(VIEW_TYPE_NODEPAD);
+		if (leaves.length > 0) {
+			leaf = leaves[0];
+		} else {
+			leaf = workspace.getLeaf(true);
+			if (leaf) {
+				await leaf.setViewState({ type: VIEW_TYPE_NODEPAD, active: true });
+			}
+		}
+		if (leaf) workspace.revealLeaf(leaf);
 	}
 
 	async activateView() {

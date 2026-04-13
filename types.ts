@@ -38,7 +38,7 @@ export type OpenRouterModel =
 	| 'openrouter/mistral/mistral-large'
 	| 'openrouter/deepseek/deepseek-chat';
 
-export type AIModel = ClaudeModel | GeminiModel | OpenRouterModel;
+export type AIModel = ClaudeModel | GeminiModel | OpenRouterModel | string;
 
 // MCP Server Configuration
 export interface MCPServer {
